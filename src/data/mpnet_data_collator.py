@@ -1,217 +1,242 @@
-import torch
 import random
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+import torch
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Union, Any
+import math
+from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 
+@dataclass
 class MPNetDataCollator:
     """
     Data collator for MPNet pretraining.
-    It permutes sequences and prepares inputs according to the MPNet paper:
-    - Permutes the sequence
-    - Chooses rightmost 15% tokens to predict
-    - Adds mask tokens before predicted part
-    - Prepares position information and attention masks
+    
+    This collator implements the data preprocessing strategy described in the MPNet paper:
+    1. Randomly permute the sequence
+    2. Choose rightmost portion (determined by mlm_probability) of tokens to predict
+    3. For non-predicted (context) tokens, apply bidirectional attention
+    4. For predicted tokens, apply autoregressive attention with position compensation
+    5. Apply masking to input tokens with an MLM-style strategy
+    
+    Args:
+        tokenizer: Tokenizer to use for encoding/decoding
+        mlm_probability: Probability of choosing a token for prediction
+        mask_probability: Probability of masking a token in the predicted set (typically higher than mlm_probability)
     """
     
-    def __init__(
-        self,
-        tokenizer,
-        mlm_probability=0.15,
-        pad_to_multiple_of=None,
-        return_tensors="pt",
-        whole_word_mask=True,
-    ):
-        self.tokenizer = tokenizer
-        self.mlm_probability = mlm_probability
-        self.pad_to_multiple_of = pad_to_multiple_of
-        self.return_tensors = return_tensors
-        self.whole_word_mask = whole_word_mask
-        self.vocab_size = tokenizer.vocab_size
+    tokenizer: PreTrainedTokenizerBase
+    mlm_probability: float = 0.15
+    mask_probability: float = 0.80
+    random_replacement_probability: float = 0.10
+    pad_to_multiple_of: Optional[int] = None
+    return_tensors: str = "pt"
     
-    def __call__(self, examples):
-        # Prepare batch
-        batch = self._prepare_batch(examples)
+    def __post_init__(self):
+        if self.tokenizer.mask_token is None:
+            raise ValueError("The tokenizer does not have a mask token. Please use a different tokenizer.")
+            
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        Process a batch of examples for MPNet pretraining.
         
-        # Permute sequences
-        input_ids, attention_mask, position_ids, permutation_indices = self._permute_sequences(batch)
+        Args:
+            examples: List of tokenized examples with 'input_ids' and 'attention_mask'
+            
+        Returns:
+            Batch dictionary with:
+            - input_ids: Input tokens with masking applied
+            - attention_mask: Attention mask for padding
+            - is_predicted_mask: Boolean mask indicating which tokens are in the predicted set
+            - labels: Labels for loss computation (-100 for tokens not being predicted)
+            - position_ids: Position IDs after permutation (used for position compensation)
+        """
+        batch = self._collate_batch(examples)
         
-        # Split into non-predicted and predicted parts
-        non_pred_ids, pred_ids, pred_positions, mask_indices = self._split_into_parts(
-            input_ids, permutation_indices, attention_mask
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        batch_size, seq_length = input_ids.size()
+        
+        # Create a permutation for each sequence
+        permuted_indices, permuted_input_ids, permuted_attention_mask, position_ids = self._permute_sequences(
+            input_ids, attention_mask
         )
         
-        # Create final inputs with mask tokens
-        final_input_ids, final_attention_mask, final_position_ids, labels = self._create_final_inputs(
-            non_pred_ids, pred_ids, pred_positions, mask_indices, input_ids, position_ids, attention_mask
+        # Split into predicted and non-predicted tokens
+        is_predicted_mask, predicted_indices = self._create_prediction_mask(permuted_attention_mask)
+        
+        # Apply masking strategy to predicted tokens
+        masked_input_ids, labels = self._mask_predicted_tokens(
+            permuted_input_ids, is_predicted_mask, predicted_indices
         )
         
-        return {
-            "input_ids": final_input_ids,
-            "attention_mask": final_attention_mask,
-            "position_ids": final_position_ids,
-            "labels": labels,
-            "cu_seqlens": self._get_cu_seqlens(final_attention_mask),
-            "max_seqlen": final_input_ids.size(1),
-            "indices": self._get_indices(final_attention_mask),
-        }
-    
-    def _prepare_batch(self, examples):
-        # Convert examples to tensors
+        # Prepare final batch
         batch = {
-            "input_ids": [example["input_ids"] for example in examples],
-            "attention_mask": [example["attention_mask"] for example in examples]
+            "input_ids": masked_input_ids,
+            "attention_mask": permuted_attention_mask,
+            "is_predicted_mask": is_predicted_mask,
+            "labels": labels,
+            "position_ids": position_ids,
         }
+        
         return batch
     
-    def _permute_sequences(self, batch):
-        input_ids_list = batch["input_ids"]
-        attention_mask_list = batch["attention_mask"]
+    def _collate_batch(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate examples into a batch.
+        """
+        # Convert list of dictionaries to dictionary of lists
+        batch = {
+            key: [example[key] for example in examples] 
+            for key in examples[0].keys()
+        }
         
-        permuted_input_ids = []
-        permuted_attention_mask = []
-        permuted_position_ids = []
-        permutation_indices_list = []
+        # Special handling for input_ids and attention_mask to ensure proper padding
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask", None)
         
-        for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
-            # Get valid token indices (non-padding)
-            valid_indices = [i for i, mask in enumerate(attention_mask) if mask == 1]
-            seq_len = len(valid_indices)
-            
-            # Create permutation
-            permutation = list(range(seq_len))
-            random.shuffle(permutation)
-            
-            # Map to original indices
-            permutation_indices = [valid_indices[i] for i in permutation]
-            
-            # Create permuted sequence
-            permuted_ids = [input_ids[i] for i in permutation_indices] + [
-                input_ids[i] for i in range(len(input_ids)) if i not in valid_indices
-            ]
-            
-            # Create permuted attention mask
-            permuted_mask = [1] * seq_len + [0] * (len(attention_mask) - seq_len)
-            
-            # Create position ids (original positions)
-            position_ids = list(range(len(input_ids)))
-            permuted_pos = [position_ids[i] for i in permutation_indices] + [
-                position_ids[i] for i in range(len(position_ids)) if i not in valid_indices
-            ]
-            
-            permuted_input_ids.append(permuted_ids)
-            permuted_attention_mask.append(permuted_mask)
-            permuted_position_ids.append(permuted_pos)
-            permutation_indices_list.append(permutation_indices)
+        # If examples are already tensors
+        if isinstance(input_ids[0], torch.Tensor):
+            input_ids = torch.nn.utils.rnn.pad_sequence(
+                input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            )
+        else:
+            input_ids = torch.tensor([ids for ids in input_ids])
         
-        return (
-            torch.tensor(permuted_input_ids),
-            torch.tensor(permuted_attention_mask),
-            torch.tensor(permuted_position_ids),
-            permutation_indices_list
-        )
-    
-    def _split_into_parts(self, input_ids, permutation_indices, attention_mask):
-        batch_size, seq_len = input_ids.size()
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+            attention_mask[input_ids == self.tokenizer.pad_token_id] = 0
+        elif isinstance(attention_mask[0], torch.Tensor):
+            attention_mask = torch.nn.utils.rnn.pad_sequence(
+                attention_mask, batch_first=True, padding_value=0
+            )
+        else:
+            attention_mask = torch.tensor([mask for mask in attention_mask])
         
-        non_pred_ids = []
-        pred_ids = []
-        pred_positions = []
-        mask_indices = []
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+
+    def _permute_sequences(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Randomly permute sequences while preserving padding.
         
-        for i in range(batch_size):
-            valid_len = attention_mask[i].sum().item()
-            c = int(valid_len * (1 - self.mlm_probability))  # Number of non-predicted tokens
-            
-            # Split sequence
-            non_pred = input_ids[i, :c].tolist()
-            pred = input_ids[i, c:valid_len].tolist()
-            
-            # Get positions of predicted tokens in original sequence
-            pred_pos = permutation_indices[i][c:valid_len]
-            
-            # Create mask indices (positions where mask tokens will be placed)
-            mask_idx = list(range(c, valid_len))
-            
-            non_pred_ids.append(non_pred + [self.tokenizer.pad_token_id] * (c - len(non_pred)))
-            pred_ids.append(pred + [self.tokenizer.pad_token_id] * (valid_len - c - len(pred)))
-            pred_positions.append(pred_pos + [0] * (valid_len - c - len(pred_pos)))
-            mask_indices.append(mask_idx + [0] * (valid_len - c - len(mask_idx)))
-        
-        return (
-            torch.tensor(non_pred_ids),
-            torch.tensor(pred_ids),
-            torch.tensor(pred_positions),
-            torch.tensor(mask_indices)
-        )
-    
-    def _create_final_inputs(self, non_pred_ids, pred_ids, pred_positions, mask_indices, 
-                            original_ids, position_ids, attention_mask):
-        batch_size = non_pred_ids.size(0)
-        non_pred_len = non_pred_ids.size(1)
-        pred_len = pred_ids.size(1)
-        
-        # Create final input ids with mask tokens
-        final_input_ids = []
-        final_attention_mask = []
-        final_position_ids = []
-        labels = []
+        Returns:
+            - permuted_indices: List of permutation indices per sequence
+            - permuted_input_ids: Input IDs after permutation
+            - permuted_attention_mask: Attention mask after permutation  
+            - position_ids: Position IDs tracking original positions
+        """
+        batch_size, seq_length = input_ids.size()
+        permuted_input_ids = input_ids.clone()
+        permuted_attention_mask = attention_mask.clone()
+        position_ids = torch.zeros_like(input_ids)
+        permuted_indices = []
         
         for i in range(batch_size):
-            # Get non-predicted part
-            non_pred = non_pred_ids[i, :non_pred_len].tolist()
+            # Find non-padding positions
+            valid_indices = torch.nonzero(attention_mask[i], as_tuple=True)[0]
+            num_valid = len(valid_indices)
             
-            # Add mask tokens
-            masks = [self.tokenizer.mask_token_id] * pred_len
+            # Create random permutation for non-padding tokens
+            perm = torch.randperm(num_valid, device=input_ids.device)
+            permuted_indices.append(valid_indices[perm])
             
-            # Add predicted tokens (for content stream)
-            pred = pred_ids[i, :pred_len].tolist()
+            # Apply permutation to input_ids
+            permuted_input_ids[i, :num_valid] = input_ids[i, valid_indices[perm]]
             
-            # Combine all parts
-            final_ids = non_pred + masks + pred
+            # Create position_ids that track original positions
+            for j, idx in enumerate(perm):
+                position_ids[i, j] = valid_indices[idx]
             
-            # Create attention mask
-            final_mask = [1] * (len(non_pred) + len(masks) + len(pred))
+            # Keep padding as is
+            if num_valid < seq_length:
+                permuted_input_ids[i, num_valid:] = input_ids[i, num_valid:]
+                position_ids[i, num_valid:] = torch.arange(
+                    num_valid, seq_length, device=input_ids.device
+                )
             
-            # Create position ids - match original positions
-            non_pred_pos = position_ids[i, :non_pred_len].tolist()
-            pred_pos = [position_ids[i, pos].item() if pos < position_ids.size(1) else 0 
-                       for pos in pred_positions[i, :pred_len].tolist()]
-            
-            # Final position ids
-            final_pos = non_pred_pos + pred_pos + pred_pos
-            
-            # Create labels (-100 for non-predicted tokens)
-            label = [-100] * (len(non_pred) + len(masks)) + pred
-            
-            # Pad if needed
-            max_len = max(len(final_ids), len(final_mask), len(final_pos), len(label))
-            final_ids = final_ids + [self.tokenizer.pad_token_id] * (max_len - len(final_ids))
-            final_mask = final_mask + [0] * (max_len - len(final_mask))
-            final_pos = final_pos + [0] * (max_len - len(final_pos))
-            label = label + [-100] * (max_len - len(label))
-            
-            final_input_ids.append(final_ids)
-            final_attention_mask.append(final_mask)
-            final_position_ids.append(final_pos)
-            labels.append(label)
+        return permuted_indices, permuted_input_ids, permuted_attention_mask, position_ids
+    
+    def _create_prediction_mask(
+        self, 
+        attention_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Create a mask to identify tokens to predict (rightmost portion of permuted sequence).
         
-        return (
-            torch.tensor(final_input_ids),
-            torch.tensor(final_attention_mask),
-            torch.tensor(final_position_ids),
-            torch.tensor(labels)
-        )
+        Returns:
+            - is_predicted_mask: Boolean tensor where True indicates tokens to predict
+            - predicted_indices: List of indices per sequence of tokens to predict
+        """
+        batch_size, seq_length = attention_mask.size()
+        is_predicted_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+        predicted_indices = []
+        
+        for i in range(batch_size):
+            # Get valid token positions
+            valid_indices = torch.nonzero(attention_mask[i], as_tuple=True)[0]
+            num_valid = len(valid_indices)
+            
+            # Determine how many tokens to predict based on mlm_probability
+            num_to_predict = max(1, int(num_valid * self.mlm_probability))
+            
+            # Choose the rightmost portion as MPNet does
+            prediction_indices = valid_indices[-num_to_predict:]
+            predicted_indices.append(prediction_indices)
+            
+            # Set the mask for these positions
+            is_predicted_mask[i, prediction_indices] = True
+            
+        return is_predicted_mask, predicted_indices
     
-    def _get_cu_seqlens(self, attention_mask):
-        # Calculate cumulative sequence lengths for unpadded attention
-        cu_seqlens = torch.zeros(attention_mask.size(0) + 1, dtype=torch.int32)
-        cu_seqlens[1:] = torch.cumsum(attention_mask.sum(dim=1), dim=0)
-        return cu_seqlens
-    
-    def _get_indices(self, attention_mask):
-        # Get indices for unpadded tokens
-        indices = torch.zeros_like(attention_mask, dtype=torch.int32)
-        for i in range(attention_mask.size(0)):
-            indices[i, :attention_mask[i].sum()] = torch.arange(attention_mask[i].sum())
-        return indices.view(-1)[attention_mask.view(-1) == 1]
+    def _mask_predicted_tokens(
+        self, 
+        input_ids: torch.Tensor, 
+        is_predicted_mask: torch.Tensor,
+        predicted_indices: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply masking strategy to predicted tokens: 80% mask, 10% random, 10% unchanged.
+        
+        Returns:
+            - masked_input_ids: Input ids with masking applied
+            - labels: Labels for loss computation (-100 for non-predicted tokens)
+        """
+        batch_size, seq_length = input_ids.size()
+        masked_input_ids = input_ids.clone()
+        
+        # Initialize labels with -100 (ignored in loss)
+        labels = torch.full_like(input_ids, -100)
+        
+        for i in range(batch_size):
+            # Set labels for predicted tokens
+            predicted_positions = predicted_indices[i]
+            labels[i, predicted_positions] = input_ids[i, predicted_positions].clone()
+            
+            # Create random numbers for masking strategy
+            rand = torch.rand(len(predicted_positions), device=input_ids.device)
+            
+            # Indices for each masking strategy
+            mask_indices = predicted_positions[rand < self.mask_probability]
+            random_indices = predicted_positions[(rand >= self.mask_probability) & 
+                                             (rand < self.mask_probability + self.random_replacement_probability)]
+            
+            # Apply mask token
+            masked_input_ids[i, mask_indices] = self.tokenizer.mask_token_id
+            
+            # Apply random tokens
+            if len(random_indices) > 0:
+                random_words = torch.randint(
+                    len(self.tokenizer), 
+                    (len(random_indices),), 
+                    device=input_ids.device
+                )
+                masked_input_ids[i, random_indices] = random_words
+        
+        return masked_input_ids, labels
